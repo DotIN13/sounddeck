@@ -1,5 +1,5 @@
 // --------------------------------------------------------------------
-// file: app/page.tsx  (Client UI using shadcn/ui + Batch to Folder via File System Access API + FLAC tagging via metaflac.wasm; flac.wasm fallback)
+// file: app/page.tsx  (Client UI using shadcn/ui + Single-file download with visual progress + FLAC tagging via metaflac.wasm; flac.wasm fallback)
 // --------------------------------------------------------------------
 "use client";
 import React, { useEffect, useRef, useState } from "react";
@@ -33,6 +33,59 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Label } from "@/components/ui/label";
 import { Checkbox } from "@/components/ui/checkbox";
 
+// —— UI: iOS-style circular progress (determinate + indeterminate)
+function ProgressCircle({
+  pct,
+  indeterminate,
+}: {
+  pct?: number;
+  indeterminate?: boolean;
+}) {
+  const size = 28; // px
+  const stroke = 3;
+  const r = (size - stroke) / 2;
+  const C = 2 * Math.PI * r;
+  const clamped = typeof pct === "number" ? Math.max(0, Math.min(100, pct)) : 0;
+  const dash = indeterminate ? C * 0.25 : (C * clamped) / 100;
+  return (
+    <div
+      className={`relative inline-flex items-center justify-center`}
+      style={{ width: size, height: size }}
+      aria-label={indeterminate ? "Working…" : `Progress ${clamped}%`}
+    >
+      <svg
+        width={size}
+        height={size}
+        className={indeterminate ? "animate-spin" : ""}
+        style={{ animationDuration: indeterminate ? "1s" : undefined }}
+      >
+        <circle
+          cx={size / 2}
+          cy={size / 2}
+          r={r}
+          strokeWidth={stroke}
+          className="text-muted"
+          stroke="currentColor"
+          fill="none"
+          opacity={0.25}
+        />
+        <circle
+          cx={size / 2}
+          cy={size / 2}
+          r={r}
+          strokeWidth={stroke}
+          strokeLinecap="round"
+          strokeDasharray={`${dash} ${C}`}
+          className="text-primary"
+          stroke="currentColor"
+          fill="none"
+          transform={`rotate(-90 ${size / 2} ${size / 2})`}
+        />
+      </svg>
+    </div>
+  );
+}
+
 // ——— Types
 interface TrackItem {
   id: string;
@@ -50,6 +103,7 @@ interface LyricResponse {
 }
 
 const API_PROXY = "/api/music";
+const MEDIA_PROXY = "/api/media";
 const MUSIC_SOURCES = [
   "netease",
   "tencent",
@@ -74,6 +128,12 @@ const QUALITY_OPTIONS = [
 ];
 
 type MusicSource = (typeof MUSIC_SOURCES)[number];
+
+type Progress = {
+  phase: "fetch" | "tag" | "save" | "done" | "error";
+  pct?: number;
+  note?: string;
+};
 
 function arrayify(x: string | string[] | undefined | null): string[] {
   if (!x) return [];
@@ -104,16 +164,11 @@ export default function Page() {
   const [results, setResults] = useState<TrackItem[]>([]);
   const [error, setError] = useState<string | null>(null);
 
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [metaReady, setMetaReady] = useState(false);
   const [flacReady, setFlacReady] = useState(false);
 
-  const [batchBusy, setBatchBusy] = useState(false);
-  const [batchNote, setBatchNote] = useState<string | null>(null);
-  const [batchProgress, setBatchProgress] = useState<{
-    done: number;
-    total: number;
-  }>({ done: 0, total: 0 });
+  // Per-track progress map: key = `${source}:${id}`
+  const [progressMap, setProgressMap] = useState<Record<string, Progress>>({});
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
@@ -231,6 +286,43 @@ export default function Page() {
     return r.json();
   }
 
+  // Streaming fetch with progress → returns Uint8Array
+  async function fetchWithProgress(url: string, key: string) {
+    setProgressMap((p) => ({ ...p, [key]: { phase: "fetch", pct: 0 } }));
+    const resp = await fetch(`${MEDIA_PROXY}?url=${encodeURIComponent(url)}`);
+    if (!resp.ok) throw new Error(`download: ${resp.status}`);
+    const lenStr = resp.headers.get("content-length");
+    const total = lenStr ? parseInt(lenStr, 10) : 0;
+    if (!resp.body) {
+      const buf = new Uint8Array(await resp.arrayBuffer());
+      setProgressMap((p) => ({ ...p, [key]: { phase: "fetch", pct: 100 } }));
+      return buf;
+    }
+    const reader = resp.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let received = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        chunks.push(value);
+        received += value.length;
+        if (total) {
+          const pct = Math.min(99, Math.round((received / total) * 100));
+          setProgressMap((p) => ({ ...p, [key]: { phase: "fetch", pct } }));
+        }
+      }
+    }
+    const out = new Uint8Array(received);
+    let offset = 0;
+    for (const c of chunks) {
+      out.set(c, offset);
+      offset += c.length;
+    }
+    setProgressMap((p) => ({ ...p, [key]: { phase: "fetch", pct: 100 } }));
+    return out;
+  }
+
   // ---- FLAC helpers
   async function tagFlacWithMetaflac(
     inputFlac: Uint8Array,
@@ -286,172 +378,134 @@ export default function Page() {
     return out;
   }
 
-  // Prepare a tagged file but DO NOT auto-download; return filename + bytes + mime
-  async function prepareTaggedFile(track: TrackItem) {
-    const urlInfo = await fetchSongUrl(track);
-    const songUrl = urlInfo?.url as string;
-    if (!songUrl) throw new Error("No audio url");
-    const hint = parseContentTypeFromUrl(songUrl);
-    const mediaResp = await fetch(songUrl);
-    if (!mediaResp.ok) throw new Error(`download: ${mediaResp.status}`);
-    const mediaBuf = await mediaResp.arrayBuffer();
-
-    const artists = arrayify(track.artist);
-    const artistStr = artists.join(" / ");
-    const title = track.name || "Unknown Title";
-    const album = track.album || "";
-    const year = new Date().getFullYear().toString();
-    const [coverUrl, lyricData] = await Promise.all([
-      fetchAlbumArt(track, "500"),
-      fetchLyrics(track),
-    ]);
-    let coverArrayBuf: ArrayBuffer | undefined;
-    let coverMime: string | undefined;
-    if (coverUrl) {
-      try {
-        const c = await fetch(coverUrl);
-        coverMime = c.headers.get("content-type") || undefined;
-        coverArrayBuf = await c.arrayBuffer();
-      } catch {}
-    }
-    const unsyncedLyrics = stripLrcTags(lyricData?.tlyric || lyricData?.lyric);
-
-    let bytes: Uint8Array;
-    let mime = "audio/mpeg";
-    let ext = ".mp3";
-    let fnameBase = sanitizeFileName(`${artistStr} - ${title}`);
-
-    if (hint === "audio/mpeg" || /br=(128|192|320)/i.test(songUrl)) {
-      const writer = new ID3Writer(new Uint8Array(mediaBuf));
-      writer
-        .setFrame("TIT2", title)
-        .setFrame("TPE1", artists)
-        .setFrame("TALB", album)
-        .setFrame("TYER", parseInt(year, 10))
-        .setFrame("TCON", ["Other"])
-        .setFrame("TCOP", `© ${year} ${artistStr}`);
-      if (unsyncedLyrics)
-        writer.setFrame("USLT", {
-          description: "Lyrics",
-          lyrics: unsyncedLyrics,
-          language: "eng",
-        });
-      if (coverArrayBuf)
-        writer.setFrame("APIC", {
-          type: 3,
-          data: new Uint8Array(coverArrayBuf),
-          description: "Cover",
-        });
-      writer.addTag();
-      const ab = (writer as any).arrayBuffer as ArrayBuffer;
-      bytes = new Uint8Array(ab);
-      mime = "audio/mpeg";
-      ext = ".mp3";
-    } else {
-      const tags: Record<string, string> = {
-        TITLE: title,
-        ARTIST: artistStr,
-        ALBUM: album,
-        DATE: year,
-      };
-      if (unsyncedLyrics) tags["LYRICS"] = unsyncedLyrics;
-      let out: Uint8Array | undefined;
-      if (metaReady) {
-        out = await tagFlacWithMetaflac(
-          new Uint8Array(mediaBuf),
-          tags,
-          coverArrayBuf
-            ? {
-                bytes: new Uint8Array(coverArrayBuf),
-                mime: coverMime || "image/jpeg",
-              }
-            : undefined
-        );
-      } else if (flacReady) {
-        out = await tagFlacWithFlacWasm(
-          new Uint8Array(mediaBuf),
-          tags,
-          coverArrayBuf
-            ? {
-                bytes: new Uint8Array(coverArrayBuf),
-                mime: coverMime || "image/jpeg",
-              }
-            : undefined
-        );
-      }
-      if (!out) throw new Error("No FLAC tool available");
-      bytes = out;
-      mime = "audio/flac";
-      ext = ".flac";
-    }
-
-    return { fileName: `${fnameBase}${ext}`, bytes, mime };
-  }
-
-  // Single-file download via object URL (kept for convenience)
+  // Single-file download (with progress) → fetch → tag → save
   async function downloadOne(track: TrackItem) {
-    const { fileName, bytes, mime } = await prepareTaggedFile(track);
-    const blob = new Blob([bytes], { type: mime });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = fileName;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
-  }
-
-  // Batch save straight to a chosen folder (Chromium browsers)
-  async function downloadSelectedToFolder() {
+    const key = `${track.source}:${track.id}`;
     try {
-      // @ts-ignore experimental
-      if (!window.showDirectoryPicker) {
-        setBatchNote(
-          "Your browser doesn't support folder saving. Use Chrome/Edge/Opera."
-        );
-        return;
-      }
-      // @ts-ignore experimental
-      const dirHandle: FileSystemDirectoryHandle =
-        await window.showDirectoryPicker();
-      const ids = Array.from(selectedIds);
-      setBatchBusy(true);
-      setBatchNote(null);
-      setBatchProgress({ done: 0, total: ids.length });
-      for (let i = 0; i < ids.length; i++) {
-        const [src, id] = ids[i].split(":");
-        const t = results.find((r) => r.source === src && String(r.id) === id);
-        if (!t) {
-          setBatchNote(`Skipped missing result ${ids[i]}`);
-          continue;
-        }
-        try {
-          const { fileName, bytes, mime } = await prepareTaggedFile(t);
-          // Create file and stream write
-          const fileHandle = await dirHandle.getFileHandle(fileName, {
-            create: true,
-          });
-          const writable = await (fileHandle as any).createWritable();
-          await writable.write(new Blob([bytes], { type: mime }));
-          await writable.close();
-        } catch (e: any) {
-          setBatchNote(`Error on ${t.name}: ${e?.message ?? e}`);
-        }
-        setBatchProgress({ done: i + 1, total: ids.length });
-      }
-      setBatchNote(`Saved ${ids.length} file(s) to selected folder.`);
-    } finally {
-      setBatchBusy(false);
-    }
-  }
+      // 1) Resolve URL
+      const urlInfo = await fetchSongUrl(track);
+      const songUrl = urlInfo?.url as string;
+      if (!songUrl) throw new Error("No audio url");
+      const hint = parseContentTypeFromUrl(songUrl);
 
-  function toggleSelect(track: TrackItem) {
-    setSelectedIds((prev) => {
-      const next = new Set(prev);
-      const key = `${track.source}:${track.id}`;
-      next.has(key) ? next.delete(key) : next.add(key);
-      return next;
-    });
+      // 2) Fetch media with progress
+      const mediaBytes = await fetchWithProgress(songUrl, key);
+
+      // 3) Gather tags
+      const artists = arrayify(track.artist);
+      const artistStr = artists.join(" / ");
+      const title = track.name || "Unknown Title";
+      const album = track.album || "";
+      const year = new Date().getFullYear().toString();
+      const [coverUrl, lyricData] = await Promise.all([
+        fetchAlbumArt(track, "500"),
+        fetchLyrics(track),
+      ]);
+      let coverBytes: Uint8Array | undefined;
+      let coverMime: string | undefined;
+      if (coverUrl) {
+        try {
+          const c = await fetch(
+            `${MEDIA_PROXY}?url=${encodeURIComponent(coverUrl)}`
+          );
+          coverMime = c.headers.get("content-type") || undefined;
+          const ab = await c.arrayBuffer();
+          coverBytes = new Uint8Array(ab);
+        } catch {}
+      }
+      const unsyncedLyrics = stripLrcTags(
+        lyricData?.tlyric || lyricData?.lyric
+      );
+
+      // 4) Tagging
+      setProgressMap((p) => ({
+        ...p,
+        [key]: { phase: "tag", pct: 100, note: "Tagging…" },
+      }));
+      let outBytes: Uint8Array;
+      let mime = "audio/mpeg";
+      let ext = ".mp3";
+      let fnameBase = sanitizeFileName(`${artistStr} - ${title}`);
+      if (hint === "audio/mpeg") {
+        const writer = new ID3Writer(mediaBytes.buffer);
+        writer
+          .setFrame("TIT2", title)
+          .setFrame("TPE1", artists)
+          .setFrame("TALB", album)
+          .setFrame("TYER", parseInt(year, 10))
+          .setFrame("TCON", ["Other"])
+          .setFrame("TCOP", `© ${year} ${artistStr}`);
+        if (unsyncedLyrics)
+          writer.setFrame("USLT", {
+            description: "Lyrics",
+            lyrics: unsyncedLyrics,
+            language: "eng",
+          });
+        if (coverBytes)
+          writer.setFrame("APIC", {
+            type: 3,
+            data: coverBytes.buffer,
+            description: "Cover",
+          });
+        writer.addTag();
+        outBytes = new Uint8Array(writer.arrayBuffer as ArrayBuffer);
+        mime = "audio/mpeg";
+        ext = ".mp3";
+      } else {
+        const tags: Record<string, string> = {
+          TITLE: title,
+          ARTIST: artistStr,
+          ALBUM: album,
+          DATE: year,
+        };
+        if (unsyncedLyrics) tags["LYRICS"] = unsyncedLyrics;
+        let flacOut: Uint8Array | undefined;
+        if (metaReady) {
+          flacOut = await tagFlacWithMetaflac(
+            mediaBytes,
+            tags,
+            coverBytes
+              ? { bytes: coverBytes, mime: coverMime || "image/jpeg" }
+              : undefined
+          );
+        } else if (flacReady) {
+          flacOut = await tagFlacWithFlacWasm(
+            mediaBytes,
+            tags,
+            coverBytes
+              ? { bytes: coverBytes, mime: coverMime || "image/jpeg" }
+              : undefined
+          );
+        }
+        if (!flacOut) throw new Error("No FLAC tool available");
+        outBytes = flacOut;
+        mime = "audio/flac";
+        ext = ".flac";
+      }
+
+      // 5) Save
+      setProgressMap((p) => ({
+        ...p,
+        [key]: { phase: "save", pct: 100, note: "Saving…" },
+      }));
+      const blob = new Blob([outBytes], { type: mime });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `${fnameBase}${ext}`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+      setProgressMap((p) => ({
+        ...p,
+        [key]: { phase: "done", pct: 100, note: "Done" },
+      }));
+    } catch (e: any) {
+      setProgressMap((p) => ({
+        ...p,
+        [key]: { phase: "error", pct: 0, note: e?.message || "Failed" },
+      }));
+    }
   }
 
   return (
@@ -569,21 +623,26 @@ export default function Page() {
               )}
               {results.map((t) => {
                 const key = `${t.source}:${t.id}`;
-                const selected = selectedIds.has(key);
                 const artists = arrayify(t.artist).join(" / ");
+                const pr = progressMap[key];
                 return (
                   <TableRow key={key} className="hover:bg-muted/50">
                     <TableCell>
                       <Checkbox
-                        checked={selected}
-                        onCheckedChange={() => toggleSelect(t)}
+                        checked={
+                          !!pr && pr.phase != "done" && pr.phase != "error"
+                        }
+                        onCheckedChange={() => {
+                          /* kept as a stub for future multi-select actions */
+                        }}
+                        disabled
                       />
                     </TableCell>
                     <TableCell className="font-medium">{t.name}</TableCell>
                     <TableCell>{artists || "-"}</TableCell>
                     <TableCell>{t.album || "-"}</TableCell>
                     <TableCell className="text-right">
-                      <div className="inline-flex gap-2">
+                      <div className="inline-flex items-center gap-2">
                         <Button
                           variant="outline"
                           size="sm"
@@ -592,10 +651,23 @@ export default function Page() {
                           <Play className="w-4 h-4 mr-1" />
                           Preview
                         </Button>
-                        <Button size="sm" onClick={() => downloadOne(t)}>
-                          <Download className="w-4 h-4 mr-1" />
-                          Download
-                        </Button>
+                        {pr && pr.phase !== "done" && pr.phase !== "error" ? (
+                          <div className="px-2" title={`${pr.phase}…`}>
+                            <ProgressCircle
+                              pct={pr.pct}
+                              indeterminate={
+                                pr.phase !== "fetch" &&
+                                pr.phase !== "done" &&
+                                pr.phase !== "error"
+                              }
+                            />
+                          </div>
+                        ) : (
+                          <Button size="sm" onClick={() => downloadOne(t)}>
+                            <Download className="w-4 h-4 mr-1" />
+                            Download
+                          </Button>
+                        )}
                       </div>
                     </TableCell>
                   </TableRow>
@@ -607,32 +679,11 @@ export default function Page() {
       </Card>
 
       <div className="flex items-center gap-2 mt-3">
-        <Button
-          variant="secondary"
-          onClick={downloadSelectedToFolder}
-          disabled={selectedIds.size === 0 || batchBusy}
-        >
-          Save Selected to Folder
-        </Button>
-        <div className="text-xs text-muted-foreground ml-2">
-          (Uses File System Access API on Chromium-based browsers)
-        </div>
         <div className="ml-auto text-xs text-muted-foreground">
           FLAC tools: metaflac {metaReady ? "✓" : "×"} / flac{" "}
           {flacReady ? "✓" : "×"}
         </div>
       </div>
-
-      {(batchBusy || batchNote) && (
-        <div className="mt-2 text-xs text-muted-foreground">
-          {batchBusy && (
-            <span>
-              Saving… {batchProgress.done}/{batchProgress.total}
-            </span>
-          )}
-          {batchNote && <div>{batchNote}</div>}
-        </div>
-      )}
 
       <audio
         ref={audioRef}
@@ -652,16 +703,12 @@ export default function Page() {
       <div className="text-xs text-muted-foreground mt-4 space-y-1">
         <p>
           Some sources may fail due to region/account limits. If download fails,
-          try another source or bitrate (320kbps is ideal for MP3 tagging).
+          try another source or bitrate.
         </p>
         <p>
           MP3 uses ID3v2.3 (title/artist/album/year/cover/lyrics). FLAC tagging
           uses <code>metaflac.wasm</code> without re-encode; if unavailable, we
           fall back to <code>flac.wasm</code>.
-        </p>
-        <p>
-          Folder saving writes directly to disk with the File System Access API.
-          Your browser will prompt for permission.
         </p>
       </div>
     </div>

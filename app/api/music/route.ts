@@ -2,7 +2,9 @@
 // file: app/api/music/route.ts  (Proxy to GDStudio API)
 // --------------------------------------------------------------------
 import { NextRequest, NextResponse } from "next/server";
+
 const API_BASE = "https://music-api.gdstudio.xyz/api.php";
+
 export async function GET(req: NextRequest) {
   const url = new URL(API_BASE);
   req.nextUrl.searchParams.forEach((v, k) => url.searchParams.set(k, v));
